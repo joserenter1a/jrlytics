@@ -1,0 +1,17 @@
+[project]
+name = "jlytics"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "datafusion>=51.0.0",
+    "pandas>=3.0.1",
+    "pyarrow>=23.0.1",
+    "ty>=0.0.17",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
