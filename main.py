@@ -1,6 +1,6 @@
 import pathlib
 
-from engine import AnalyticsEngine, EngineConfig
+from engine.engine import AnalyticsEngine, EngineConfig
 from engine.ingestion import IngestionManager
 
 THIS_DIR = pathlib.Path(__file__).parent
@@ -24,6 +24,7 @@ def get_airports():
     Returns:
         A :class:`~engine.result.QueryResult` containing all airport rows.
     """
+    main()
     result = engine.execute_sql("SELECT * FROM airports")
     print(result)
     print(result.table)
