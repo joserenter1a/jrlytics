@@ -16,7 +16,7 @@ import pyarrow
 import pyarrow.parquet
 import pytest
 
-from engine import AnalyticsEngine, EngineConfig
+from engine.engine import AnalyticsEngine, EngineConfig
 from engine.catalog import CatalogManager
 from engine.ingestion import IngestionManager
 
@@ -443,20 +443,49 @@ class TestQueryTimePruning:
         assert result.table.num_rows == 0
 
     def test_prune_segments_method_directly(self, pruning_engine: AnalyticsEngine):
-        paths = pruning_engine._prune_segments("events", "id", ">=", "150")
-        # Only segment 3 qualifies
-        assert len(paths) == 1
+        # segment 1 has no id stats → kept conservatively; segment 2 max=105 < 150
+        # → pruned; segment 3 max=205 >= 150 → kept
+        paths = pruning_engine._prune_segments("events", [("id", ">=", "150")])
+        assert len(paths) == 2
 
     def test_prune_lte_keeps_correct_segments(self, pruning_engine: AnalyticsEngine):
-        paths = pruning_engine._prune_segments("events", "id", "<=", "150")
-        # segment 2 (max=105 ≤ 150) qualifies; segment 3 (min=200 > 150) is pruned
-        assert len(paths) == 1
+        # segment 1 no stats → kept; segment 2 min=100 ≤ 150 → kept;
+        # segment 3 min=200 > 150 → pruned
+        paths = pruning_engine._prune_segments("events", [("id", "<=", "150")])
+        assert len(paths) == 2
 
     def test_prune_eq_excludes_both_non_matching_segments(
         self, pruning_engine: AnalyticsEngine
     ):
-        paths = pruning_engine._prune_segments("events", "id", "=", "202")
+        # segment 1 no stats → kept; segment 2 [100,105] excludes 202 → pruned;
+        # segment 3 [200,205] contains 202 → kept
+        paths = pruning_engine._prune_segments("events", [("id", "=", "202")])
+        assert len(paths) == 2
+
+    def test_and_prune_intersects_conditions(self, pruning_engine: AnalyticsEngine):
+        # segment 1 no stats → kept; segment 2 max=105 < 150 → pruned by first filter;
+        # segment 3 [200,205] satisfies both → kept
+        paths = pruning_engine._prune_segments(
+            "events", [("id", ">=", "150"), ("id", "<=", "210")]
+        )
+        assert len(paths) == 2
+
+    def test_and_prune_no_overlap_returns_only_no_stats_segment(
+        self, pruning_engine: AnalyticsEngine
+    ):
+        # segment 1 no stats → kept conservatively; segment 2 max=105 < 150 → pruned;
+        # segment 3 min=200 > 110 → pruned
+        paths = pruning_engine._prune_segments(
+            "events", [("id", ">=", "150"), ("id", "<=", "110")]
+        )
         assert len(paths) == 1
+
+    def test_and_filter_in_sql(self, pruning_engine: AnalyticsEngine):
+        result = pruning_engine.execute_sql(
+            "SELECT id FROM events WHERE id >= 200 AND id <= 203"
+        )
+        ids = result.table.to_pydict()["id"]
+        assert ids == [200, 201, 202, 203]
 
 
 # ---------------------------------------------------------------------------
@@ -660,3 +689,137 @@ class TestQueryResult:
         ingestor.ingest_file(src, "t")
         result = engine.execute_sql("SELECT * FROM t")
         assert "rows=3" in repr(result)
+
+
+# ---------------------------------------------------------------------------
+# JOIN support
+# ---------------------------------------------------------------------------
+
+
+class TestJoinQueries:
+    """Verify that execute_sql correctly handles INNER, LEFT, and filtered JOINs.
+
+    Fixture layout
+    --------------
+    orders table (2 segments):
+      - Segment 1 (first ingest, no stats): order_id=[1,2], customer_id=[10,10], amount=[100,200]
+      - Segment 2 (stats stored):           order_id=[3,4], customer_id=[20,30], amount=[300,400]
+
+    customers table (1 segment, no stats):
+      - customer_id=[10,20,30], name=["alice","bob","charlie"]
+    """
+
+    @pytest.fixture
+    def join_engine(
+        self,
+        ingestor: IngestionManager,
+        engine: AnalyticsEngine,
+        tmp_path: pathlib.Path,
+    ) -> AnalyticsEngine:
+        """Set up two catalogued tables suitable for JOIN tests."""
+        src_o1 = write_parquet(
+            tmp_path / "o1.parquet",
+            {"order_id": [1, 2], "customer_id": [10, 10], "amount": [100, 200]},
+        )
+        src_o2 = write_parquet(
+            tmp_path / "o2.parquet",
+            {"order_id": [3, 4], "customer_id": [20, 30], "amount": [300, 400]},
+        )
+        ingestor.ingest_file(src_o1, "orders")
+        ingestor.ingest_file(src_o2, "orders")
+
+        src_c = write_parquet(
+            tmp_path / "c1.parquet",
+            {"customer_id": [10, 20, 30], "name": ["alice", "bob", "charlie"]},
+        )
+        ingestor.ingest_file(src_c, "customers")
+        return engine
+
+    def test_extract_table_names_single_table(
+        self, join_engine: AnalyticsEngine
+    ) -> None:
+        """_extract_table_names returns a one-element list for a plain SELECT."""
+        names = join_engine._extract_table_names("SELECT * FROM orders")
+        assert names == ["orders"]
+
+    def test_extract_table_names_inner_join(
+        self, join_engine: AnalyticsEngine
+    ) -> None:
+        """_extract_table_names extracts both tables from an INNER JOIN query."""
+        sql = (
+            "SELECT * FROM orders "
+            "INNER JOIN customers ON orders.customer_id = customers.customer_id"
+        )
+        names = join_engine._extract_table_names(sql)
+        assert names[0] == "orders"
+        assert "customers" in names
+        assert len(names) == 2
+
+    def test_extract_table_names_multiple_joins(
+        self, join_engine: AnalyticsEngine
+    ) -> None:
+        """_extract_table_names handles multiple consecutive JOIN clauses."""
+        sql = (
+            "SELECT * FROM a "
+            "INNER JOIN b ON a.id = b.id "
+            "LEFT JOIN c ON b.id = c.id"
+        )
+        names = join_engine._extract_table_names(sql)
+        assert names == ["a", "b", "c"]
+
+    def test_inner_join_row_count(self, join_engine: AnalyticsEngine) -> None:
+        """INNER JOIN across both segments produces the correct number of rows."""
+        result = join_engine.execute_sql(
+            "SELECT orders.order_id, customers.name "
+            "FROM orders "
+            "INNER JOIN customers ON orders.customer_id = customers.customer_id"
+        )
+        assert result.table.num_rows == 4
+
+    def test_inner_join_columns_present(self, join_engine: AnalyticsEngine) -> None:
+        """Columns from both sides of the JOIN appear in the result schema."""
+        result = join_engine.execute_sql(
+            "SELECT orders.order_id, customers.name "
+            "FROM orders "
+            "INNER JOIN customers ON orders.customer_id = customers.customer_id"
+        )
+        schema_names = result.table.schema.names
+        assert "order_id" in schema_names
+        assert "name" in schema_names
+
+    def test_left_join_returns_all_left_rows(
+        self, join_engine: AnalyticsEngine
+    ) -> None:
+        """LEFT JOIN returns a row for every order regardless of match."""
+        result = join_engine.execute_sql(
+            "SELECT orders.order_id "
+            "FROM orders "
+            "LEFT JOIN customers ON orders.customer_id = customers.customer_id"
+        )
+        assert result.table.num_rows == 4
+
+    def test_join_with_where_filter(self, join_engine: AnalyticsEngine) -> None:
+        """WHERE filter is applied after the JOIN and returns correct rows.
+
+        Both order segments survive pruning (segment 1 has no stats, segment 2
+        has amount stats that satisfy >= 300).  DataFusion applies the actual
+        filter, returning only orders with amount >= 300.
+        """
+        result = join_engine.execute_sql(
+            "SELECT orders.order_id, customers.name "
+            "FROM orders "
+            "INNER JOIN customers ON orders.customer_id = customers.customer_id "
+            "WHERE orders.amount >= 300"
+        )
+        assert result.table.num_rows == 2
+        names = sorted(result.table.to_pydict()["name"])
+        assert names == ["bob", "charlie"]
+
+    def test_join_aggregate(self, join_engine: AnalyticsEngine) -> None:
+        """Aggregate queries over a JOIN return the correct scalar result."""
+        result = join_engine.execute_sql(
+            "SELECT COUNT(*) as n "
+            "FROM orders "
+            "INNER JOIN customers ON orders.customer_id = customers.customer_id"
+        )
+        assert result.table.to_pydict()["n"][0] == 4

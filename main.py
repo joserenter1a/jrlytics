@@ -24,8 +24,8 @@ def get_airports():
     Returns:
         A :class:`~engine.result.QueryResult` containing all airport rows.
     """
-    main()
-    result = engine.execute_sql("SELECT * FROM airports")
+    #main()
+    result = engine.execute_sql("SELECT * FROM public.airports WHERE iata = 'ABR' AND country = 'United States'")
     print(result)
     print(result.table)
     plans = engine.explain_sql("SELECT * FROM airports")

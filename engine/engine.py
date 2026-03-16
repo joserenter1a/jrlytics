@@ -96,25 +96,36 @@ class AnalyticsEngine:
     # SQL parsing helpers
     # ------------------------------------------------------------------
 
-    def _extract_simple_filter(self, sql: str) -> tuple[str, str, str] | None:
-        """Parse a simple single-predicate WHERE clause from a SQL string.
+    def _extract_filters(self, sql: str) -> list[tuple[str, str, str]]:
+        """Parse all simple ``column OP value`` predicates from the WHERE clause.
 
-        Recognises predicates of the form ``column OP value`` where *OP* is
-        one of ``>=``, ``<=``, or ``=``.
+        Handles multiple conditions joined by ``AND``.  Recognises operators
+        ``>=``, ``<=``, and ``=``.  Stops parsing at ``ORDER BY``, ``GROUP BY``,
+        ``HAVING``, ``LIMIT``, ``UNION``, a semicolon, or end of string.
 
         Args:
             sql: Raw SQL query string.
 
         Returns:
-            A ``(column, operator, value)`` tuple if a parseable predicate is
-            found, otherwise ``None``.
+            A list of ``(column, operator, value)`` tuples, one per recognised
+            predicate.  Returns an empty list when no WHERE clause is present
+            or no predicates are parseable.
         """
-        pattern = r"WHERE\s+(\w+)\s*(>=|<=|=)\s*'?(.*?)'?\s*(?:;|$)"
-        match = re.search(pattern, sql, re.IGNORECASE)
-        if not match:
-            return None
-        column, operator, value = match.groups()
-        return column, operator, value
+        where_match = re.search(
+            r"WHERE\s+(.+?)(?:\s+(?:ORDER|GROUP|HAVING|LIMIT|UNION)\b|;|$)",
+            sql,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not where_match:
+            return []
+        where_clause = where_match.group(1).strip()
+        conditions = re.split(r"\bAND\b", where_clause, flags=re.IGNORECASE)
+        filters: list[tuple[str, str, str]] = []
+        for cond in conditions:
+            m = re.search(r"(\w+)\s*(>=|<=|=)\s*'?([\w.]+)'?", cond.strip())
+            if m:
+                filters.append((m.group(1), m.group(2), m.group(3)))
+        return filters
 
     def _extract_table_name(self, sql: str) -> str:
         """Extract the primary table name from the FROM clause of a SQL string.
@@ -128,10 +139,48 @@ class AnalyticsEngine:
         Raises:
             ValueError: If no ``FROM`` clause can be found in *sql*.
         """
-        match = re.search(r"FROM\s+(\w+)", sql, re.IGNORECASE)
+        match = re.search(r"FROM\s+(?:\w+\.)?(\w+)", sql, re.IGNORECASE)
         if not match:
             raise ValueError("Could not determine table name from SQL")
         return match.group(1)
+
+    def _extract_table_names(self, sql: str) -> list[str]:
+        """Extract all table names referenced in the FROM and JOIN clauses.
+
+        Performs two regex passes over *sql*: one for the ``FROM`` clause and
+        one for all JOIN variants (``INNER JOIN``, ``LEFT JOIN``, ``RIGHT JOIN``,
+        ``FULL JOIN``, ``CROSS JOIN``, and their ``OUTER`` equivalents).
+        Schema-qualified names such as ``schema.table`` are handled; only the
+        unqualified table name is returned.  Duplicates are removed while
+        preserving order — the ``FROM`` table is always first.
+
+        This method does not parse subquery aliases.  A subquery starting with
+        ``(SELECT`` will not produce a spurious table name because the regex
+        requires the name to follow ``FROM`` or ``JOIN`` as a bare word token.
+        If a subquery's ``FROM`` clause is matched, the extracted name will not
+        correspond to any catalog table and will be silently ignored during
+        segment registration.
+
+        Args:
+            sql: Raw SQL SELECT statement, potentially containing zero or more
+                JOIN clauses.
+
+        Returns:
+            An ordered list of unique table name strings.  The primary
+            ``FROM`` table appears first, followed by joined tables in the
+            order they appear in *sql*.  Returns an empty list if no
+            ``FROM`` clause is present.
+        """
+        from_matches = re.findall(r"FROM\s+(?:\w+\.)?(\w+)", sql, re.IGNORECASE)
+        join_matches = re.findall(r"JOIN\s+(?:\w+\.)?(\w+)", sql, re.IGNORECASE)
+        seen: set[str] = set()
+        result: list[str] = []
+        for name in from_matches + join_matches:
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                result.append(name)
+        return result
 
     # ------------------------------------------------------------------
     # Segment pruning
@@ -140,63 +189,99 @@ class AnalyticsEngine:
     def _prune_segments(
         self,
         table_name: str,
-        column: str,
-        operator: str,
-        value: str,
+        filters: list[tuple[str, str, str]],
     ) -> list[str]:
-        """Return segment file paths whose statistics are compatible with a predicate.
+        """Return segment file paths whose statistics are compatible with all filters.
 
-        For each segment that has statistics recorded for *column*, the segment
-        is *excluded* if its ``[min, max]`` range provably cannot satisfy the
+        For each filter ``(column, operator, value)`` a segment is *excluded* if
+        its ``[min, max]`` range for that column provably cannot satisfy the
         predicate:
 
         - ``>=``: prune if ``segment_max < value``
         - ``<=``: prune if ``segment_min > value``
         - ``=``:  prune if ``value < segment_min or value > segment_max``
 
-        Segments without statistics for *column* are omitted entirely (they
-        were created via :meth:`create_table_from_parquet` which does not store
-        stats for the first segment).
+        When multiple filters are supplied (AND semantics) the surviving sets
+        are intersected — a segment must pass every filter to be included.
+
+        Segments without statistics for a filtered column are excluded from
+        that filter's candidate set (they were created via
+        :meth:`create_table_from_parquet` which does not store stats).
 
         Args:
             table_name: Logical table name to look up in the catalog.
-            column: Column name the predicate applies to.
-            operator: Comparison operator: one of ``">="``、``"<="``、``"="``.
-            value: Right-hand side of the predicate as a string.
+            filters: List of ``(column, operator, value)`` tuples.  All
+                conditions are combined with AND.
 
         Returns:
             List of absolute file-path strings for surviving segments.
         """
-        rows = self.catalog.get_segment_stats(table_name)
-        matching_paths: dict[int, str] = {}
+        all_paths = self.catalog.get_segments(table_name)
+        stats_rows = self.catalog.get_segment_stats(table_name)
 
-        for segment_id, file_path, col_name, min_val, max_val in rows:
-            if col_name != column:
-                continue
-            try:
-                value_cast: float | str = float(value)
-                min_cast: float | str = float(min_val)
-                max_cast: float | str = float(max_val)
-            except (ValueError, TypeError):
-                value_cast = value
-                min_cast = min_val
-                max_cast = max_val
+        # Build {file_path: {column: (min_val, max_val)}} from stored statistics.
+        segment_stats: dict[str, dict[str, tuple[str, str]]] = {}
+        for _sid, file_path, col_name, min_val, max_val in stats_rows:
+            segment_stats.setdefault(file_path, {})[col_name] = (min_val, max_val)
 
+        surviving: list[str] = []
+        for path in all_paths:
             include = True
-            if operator == ">=":
-                if max_cast < value_cast:
-                    include = False
-            elif operator == "<=":
-                if min_cast > value_cast:
-                    include = False
-            elif operator == "=":
-                if value_cast < min_cast or value_cast > max_cast:
-                    include = False
+            for column, operator, value in filters:
+                col_stats = segment_stats.get(path, {})
+                if column not in col_stats:
+                    # No stats for this column — cannot prune, keep the segment.
+                    continue
+                min_val, max_val = col_stats[column]
+                try:
+                    value_cast: float | str = float(value)
+                    min_cast: float | str = float(min_val)
+                    max_cast: float | str = float(max_val)
+                except (ValueError, TypeError):
+                    value_cast = value
+                    min_cast = min_val
+                    max_cast = max_val
+
+                if operator == ">=":
+                    if max_cast < value_cast:
+                        include = False
+                elif operator == "<=":
+                    if min_cast > value_cast:
+                        include = False
+                elif operator == "=":
+                    if value_cast < min_cast or value_cast > max_cast:
+                        include = False
+
+                if not include:
+                    break
 
             if include:
-                matching_paths[segment_id] = file_path
+                surviving.append(path)
 
-        return list(matching_paths.values())
+        return surviving
+
+    def _register_empty_table(self, table_name: str) -> None:
+        """Register a zero-row typed dataset for *table_name* in the session.
+
+        Used when all segments for a JOIN-side table have been pruned away so
+        that DataFusion can still resolve the table reference in the SQL
+        (a missing registration causes a table-not-found error).  The Arrow
+        schema is derived from the first segment file on disk; if the table
+        has no segments at all the call is a no-op and DataFusion will raise
+        its own table-not-found error at execution time.
+
+        Args:
+            table_name: Logical name of the table to register as empty.
+        """
+        all_paths = self.catalog.get_segments(table_name)
+        if not all_paths:
+            return
+        pf = pyarrow.parquet.ParquetFile(all_paths[0])
+        empty = pf.schema_arrow.empty_table()
+        dataset = pyarrow.dataset.dataset([empty], schema=pf.schema_arrow)
+        if table_name in self._registered_tables():
+            self.context.deregister_table(table_name)
+        self.context.register_dataset(table_name, dataset)
 
     # ------------------------------------------------------------------
     # Public API
@@ -220,40 +305,73 @@ class AnalyticsEngine:
         return list(self._registered_tables())
 
     def execute_sql(self, sql: str) -> QueryResult:
-        """Execute a SQL query with automatic segment pruning.
+        """Execute a SQL query with automatic segment pruning across all tables.
 
-        The method rebuilds the DataFusion session on every call, then
-        registers only those segments whose min/max statistics are compatible
-        with the WHERE-clause predicate (if any).  Queries without a WHERE
-        clause register all segments for the target table.
+        Rebuilds the DataFusion session on every call, then registers the
+        pruned segment set for every table referenced in the ``FROM`` and
+        ``JOIN`` clauses.  Segment pruning is applied per-table using the
+        WHERE-clause predicates extracted from *sql*; segments whose min/max
+        statistics cannot satisfy any predicate are excluded.  When a segment
+        has no statistics for a filtered column it is retained conservatively.
+
+        For JOIN queries, all participating tables are registered before
+        execution.  If a JOIN-side table's segments are pruned to empty, a
+        zero-row typed dataset is registered instead so that DataFusion can
+        still resolve the table reference (the JOIN will naturally return no
+        rows).  The early-exit empty-result path is only triggered when the
+        primary ``FROM`` table has no surviving segments.
+
+        Queries with no WHERE clause register all segments for every
+        referenced table.
 
         Args:
-            sql: A valid SQL SELECT statement.
+            sql: A valid SQL SELECT statement, optionally containing one or
+                more JOIN clauses (``INNER``, ``LEFT``, ``RIGHT``, ``FULL``,
+                ``CROSS``, and ``OUTER`` variants are all supported).
 
         Returns:
             A :class:`~engine.result.QueryResult` containing the result table
             and execution metrics.
+
+        Raises:
+            ValueError: If *sql* contains no ``FROM`` clause.
         """
-        table_name = self._extract_table_name(sql)
-        filter_info = self._extract_simple_filter(sql)
+        table_names = self._extract_table_names(sql)
+        if not table_names:
+            raise ValueError("Could not determine table name from SQL")
 
-        if filter_info:
-            column, operator, value = filter_info
-            paths = self._prune_segments(table_name, column, operator, value)
-        else:
-            paths = self.catalog.get_segments(table_name)
+        filters = self._extract_filters(sql)
+        primary_table = table_names[0]
 
-        self._create_session()
+        # Compute per-table surviving segment lists.
+        table_segments: dict[str, list[str]] = {}
+        for table_name in table_names:
+            if not self.catalog.get_tables() or table_name not in self.catalog.get_tables():
+                # Not a catalogued table (e.g. subquery alias) — skip.
+                continue
+            if filters:
+                table_segments[table_name] = self._prune_segments(table_name, filters)
+            else:
+                table_segments[table_name] = self.catalog.get_segments(table_name)
 
-        if not paths:
+        # Early exit only when the primary table yields no segments.
+        if not table_segments.get(primary_table):
             print("No matching segments after pruning")
             return QueryResult(pyarrow.table({}), QueryMetrics(0, 0, 0))
 
-        if table_name in self._registered_tables():
-            self.context.deregister_table(table_name)
+        self._create_session()
 
-        dataset = pyarrow.dataset.dataset(paths, format="parquet")
-        self.context.register_dataset(table_name, dataset)
+        for table_name, paths in table_segments.items():
+            if table_name in self._registered_tables():
+                self.context.deregister_table(table_name)
+
+            if paths:
+                dataset = pyarrow.dataset.dataset(paths, format="parquet")
+                self.context.register_dataset(table_name, dataset)
+            else:
+                # JOIN-side table pruned to empty: register a zero-row typed
+                # dataset so DataFusion can resolve the table reference.
+                self._register_empty_table(table_name)
 
         start = time.perf_counter()
         df = self.context.sql(sql)
@@ -289,6 +407,8 @@ class AnalyticsEngine:
             - ``"optimized"``: optimised logical plan.
             - ``"physical"``: physical execution plan.
         """
+        self._create_session()
+        self._bootstrap_tables()
         df = self.context.sql(sql)
         return {
             "logical": str(df.logical_plan()),
